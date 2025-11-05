@@ -100,10 +100,21 @@ class YouTubeAudioScraper:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     logger.info(f"Downloading: {url}")
                     info = ydl.extract_info(url, download=True)
+
+                    # Extract year from upload_date or release_date
+                    year = None
+                    if info.get("upload_date"):
+                        # upload_date is in YYYYMMDD format
+                        year = info.get("upload_date")[:4]
+                    elif info.get("release_date"):
+                        # release_date is in YYYY-MM-DD format
+                        year = info.get("release_date").split("-")[0]
+
                     metadata = {
                         "title": info.get("title", "Unknown"),
                         "artist": info.get("uploader", "Unknown"),
                         "thumbnail": info.get("thumbnail"),
+                        "year": year,
                     }
 
                 # Find the converted MP3 file
@@ -112,9 +123,13 @@ class YouTubeAudioScraper:
                     raise RuntimeError("No MP3 file generated")
 
                 source_mp3 = mp3_files[0]
-                output_filename = f"{metadata['title']}.mp3"
+                # Include year in filename if available
+                if metadata["year"]:
+                    output_filename = f"{metadata['title']} ({metadata['year']}).mp3"
+                else:
+                    output_filename = f"{metadata['title']}.mp3"
                 # Sanitize filename
-                output_filename = "".join(c for c in output_filename if c.isalnum() or c in " ._-")
+                output_filename = "".join(c for c in output_filename if c.isalnum() or c in " ()._-")
                 output_path = self.output_dir / output_filename
 
                 # Move file to output directory
@@ -197,7 +212,8 @@ class YouTubeAudioScraper:
                     logger.warning(f"Could not add cover art: {e}")
 
             id3.save(mp3_path, v2_version=3)
-            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'")
+            year_info = f", Year='{metadata.get('year')}'" if metadata.get('year') else ""
+            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'{year_info}")
 
         except Exception as e:
             logger.error(f"Failed to add metadata: {e}")
