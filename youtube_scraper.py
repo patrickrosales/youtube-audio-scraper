@@ -2,16 +2,30 @@
 """YouTube Audio Scraper - Extract audio from YouTube videos and save as MP3 with metadata."""
 
 import argparse
+import logging
 import os
 import sys
 import tempfile
 import requests
+from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 from mutagen.id3 import ID3, APIC, TIT2, TPE1
 from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_AUDIO_BITRATE = 320
+THUMBNAIL_CHUNK_SIZE = 8192
+THUMBNAIL_TIMEOUT = 10
 
 
 class YouTubeAudioScraper:
@@ -28,8 +42,29 @@ class YouTubeAudioScraper:
         """Validate that the URL is a YouTube URL."""
         try:
             parsed = urlparse(url)
-            return parsed.netloc in ["youtube.com", "www.youtube.com", "youtu.be", "www.youtu.be"]
+            netloc = parsed.netloc.lower()
+
+            # Check for standard YouTube domains
+            is_youtube_domain = netloc in [
+                "youtube.com",
+                "www.youtube.com",
+                "youtu.be",
+                "www.youtu.be",
+                "m.youtube.com",  # Mobile YouTube
+                "youtube-nocookie.com",
+                "www.youtube-nocookie.com",
+            ]
+
+            if not is_youtube_domain:
+                return False
+
+            # Verify there's a path or video ID
+            if not parsed.path and not parsed.query:
+                return False
+
+            return True
         except Exception:
+            logger.debug(f"URL validation error for: {url}", exc_info=True)
             return False
 
     def download_audio(self, url: str) -> tuple[str, dict]:
@@ -50,7 +85,7 @@ class YouTubeAudioScraper:
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "mp3",
-                        "preferredquality": "320",
+                        "preferredquality": DEFAULT_AUDIO_BITRATE,
                     }
                 ],
                 "outtmpl": output_template,
@@ -63,7 +98,7 @@ class YouTubeAudioScraper:
 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    print(f"Downloading: {url}")
+                    logger.info(f"Downloading: {url}")
                     info = ydl.extract_info(url, download=True)
                     metadata = {
                         "title": info.get("title", "Unknown"),
@@ -87,7 +122,23 @@ class YouTubeAudioScraper:
                 return str(output_path), metadata
 
             except yt_dlp.utils.DownloadError as e:
+                logger.error(f"Failed to download video: {e}")
                 raise RuntimeError(f"Failed to download video: {e}")
+
+    @contextmanager
+    def _progress_bar(self, total: int, desc: str = "Progress"):
+        """Context manager for progress bar lifecycle."""
+        pbar = tqdm(
+            total=total,
+            unit="B",
+            unit_scale=True,
+            desc=desc,
+            leave=True,
+        )
+        try:
+            yield pbar
+        finally:
+            pbar.close()
 
     def _progress_hook(self, d: dict):
         """Progress hook for yt-dlp downloads."""
@@ -115,7 +166,7 @@ class YouTubeAudioScraper:
             if self.pbar is not None:
                 self.pbar.close()
                 self.pbar = None
-            print("Download complete, converting to MP3...")
+            logger.info("Download complete, converting to MP3...")
 
     def add_metadata(self, mp3_path: str, metadata: dict):
         """Add ID3 tags and cover art to MP3 file."""
@@ -143,17 +194,18 @@ class YouTubeAudioScraper:
                 try:
                     self._add_cover_art(id3, metadata["thumbnail"])
                 except Exception as e:
-                    print(f"Warning: Could not add cover art: {e}")
+                    logger.warning(f"Could not add cover art: {e}")
 
             id3.save(mp3_path, v2_version=3)
-            print(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'")
+            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'")
 
         except Exception as e:
+            logger.error(f"Failed to add metadata: {e}")
             raise RuntimeError(f"Failed to add metadata: {e}")
 
     def _add_cover_art(self, id3, thumbnail_url: str):
         """Download and add cover art from thumbnail URL."""
-        response = requests.get(thumbnail_url, timeout=10, stream=True)
+        response = requests.get(thumbnail_url, timeout=THUMBNAIL_TIMEOUT, stream=True)
         response.raise_for_status()
 
         # Get content length for progress bar
@@ -161,19 +213,12 @@ class YouTubeAudioScraper:
 
         # Download with progress bar if size is known
         if total_size > 0:
-            pbar = tqdm(
-                total=total_size,
-                unit="B",
-                unit_scale=True,
-                desc="Downloading cover art",
-                leave=False,
-            )
-            content = b""
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    content += chunk
-                    pbar.update(len(chunk))
-            pbar.close()
+            with self._progress_bar(total_size, desc="Downloading cover art") as pbar:
+                content = b""
+                for chunk in response.iter_content(chunk_size=THUMBNAIL_CHUNK_SIZE):
+                    if chunk:
+                        content += chunk
+                        pbar.update(len(chunk))
         else:
             content = response.content
 
@@ -193,13 +238,13 @@ class YouTubeAudioScraper:
         try:
             output_path, metadata = self.download_audio(url)
             self.add_metadata(output_path, metadata)
-            print(f"✓ Saved to: {output_path}")
+            logger.info(f"✓ Saved to: {output_path}")
             return output_path
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            logger.error(f"Validation error: {e}")
             sys.exit(1)
         except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
+            logger.error(f"Runtime error: {e}")
             sys.exit(1)
 
 
@@ -216,8 +261,20 @@ def main():
         default=".",
         help="Output directory for MP3 files (default: current directory)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging output",
+    )
 
     args = parser.parse_args()
+
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
 
     scraper = YouTubeAudioScraper(output_dir=args.output_dir)
     scraper.scrape(args.url)
