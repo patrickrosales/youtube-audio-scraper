@@ -22,6 +22,7 @@ class YouTubeAudioScraper:
         self.output_dir = Path(output_dir or ".")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = None
+        self.pbar = None
 
     def validate_youtube_url(self, url: str) -> bool:
         """Validate that the URL is a YouTube URL."""
@@ -95,18 +96,26 @@ class YouTubeAudioScraper:
             downloaded_bytes = d.get("downloaded_bytes", 0)
 
             if total_bytes > 0:
-                percentage = (downloaded_bytes / total_bytes) * 100
-                # Display progress
-                bar_length = 40
-                filled = int(bar_length * downloaded_bytes / total_bytes)
-                bar = "█" * filled + "░" * (bar_length - filled)
-                print(
-                    f"\rDownloading: |{bar}| {percentage:.1f}%",
-                    end="",
-                    flush=True,
-                )
+                # Initialize progress bar on first update
+                if self.pbar is None:
+                    self.pbar = tqdm(
+                        total=total_bytes,
+                        unit="B",
+                        unit_scale=True,
+                        desc="Downloading",
+                        leave=True,
+                    )
+
+                # Update progress bar
+                delta = downloaded_bytes - self.pbar.n
+                if delta > 0:
+                    self.pbar.update(delta)
+
         elif d["status"] == "finished":
-            print("\nDownload complete, converting to MP3...")
+            if self.pbar is not None:
+                self.pbar.close()
+                self.pbar = None
+            print("Download complete, converting to MP3...")
 
     def add_metadata(self, mp3_path: str, metadata: dict):
         """Add ID3 tags and cover art to MP3 file."""
@@ -144,8 +153,29 @@ class YouTubeAudioScraper:
 
     def _add_cover_art(self, id3, thumbnail_url: str):
         """Download and add cover art from thumbnail URL."""
-        response = requests.get(thumbnail_url, timeout=10)
+        response = requests.get(thumbnail_url, timeout=10, stream=True)
         response.raise_for_status()
+
+        # Get content length for progress bar
+        total_size = int(response.headers.get("content-length", 0))
+
+        # Download with progress bar if size is known
+        if total_size > 0:
+            pbar = tqdm(
+                total=total_size,
+                unit="B",
+                unit_scale=True,
+                desc="Downloading cover art",
+                leave=False,
+            )
+            content = b""
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    content += chunk
+                    pbar.update(len(chunk))
+            pbar.close()
+        else:
+            content = response.content
 
         # Add cover art as APIC frame
         id3.add(
@@ -154,7 +184,7 @@ class YouTubeAudioScraper:
                 mime="image/jpeg",
                 type=3,  # Cover (front)
                 desc="Cover",
-                data=response.content,
+                data=content,
             )
         )
 
