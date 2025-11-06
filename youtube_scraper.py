@@ -4,6 +4,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 import tempfile
 import requests
@@ -141,13 +142,10 @@ class YouTubeAudioScraper:
                     raise RuntimeError("No MP3 file generated")
 
                 source_mp3 = mp3_files[0]
-                # Include year in filename if available
-                if metadata["year"]:
-                    output_filename = f"{metadata['title']} ({metadata['year']}).mp3"
-                else:
-                    output_filename = f"{metadata['title']}.mp3"
-                # Sanitize filename
-                output_filename = "".join(c for c in output_filename if c.isalnum() or c in " ()._-")
+                # Use YouTube video title as filename, preserving special characters
+                output_filename = f"{metadata['title']}.mp3"
+                # Sanitize filename to remove only truly invalid characters
+                output_filename = self._sanitize_filename(output_filename)
                 output_path = self.output_dir / output_filename
 
                 # Move file to output directory
@@ -212,6 +210,22 @@ class YouTubeAudioScraper:
         if hours > 0:
             return f"{hours}:{minutes:02d}:{seconds:02d}"
         return f"{minutes}:{seconds:02d}"
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        r"""
+        Sanitize filename by removing only truly invalid characters.
+        Preserves special characters like: - _ () [] {} & + = etc.
+        Only removes: / \ : * ? " < > |
+        """
+        # Characters that are invalid in filenames on most filesystems
+        invalid_chars = r'[\/<>:*?"|\x00-\x1f]'
+        sanitized = re.sub(invalid_chars, "", filename)
+        # Remove leading/trailing spaces and dots
+        sanitized = sanitized.strip(". ")
+        # Collapse multiple spaces into one
+        sanitized = re.sub(r"\s+", " ", sanitized)
+        return sanitized
 
     def add_metadata(self, mp3_path: str, metadata: dict):
         """Add ID3 tags and cover art to MP3 file."""
