@@ -110,10 +110,15 @@ class YouTubeAudioScraper:
                         # release_date is in YYYY-MM-DD format
                         year = info.get("release_date").split("-")[0]
 
+                    # Get video ID for consistent thumbnail URL
+                    video_id = info.get("id")
+                    # YouTube thumbnail URL format: https://img.youtube.com/vi/VIDEO_ID/maxresdefault.jpg
+                    thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg" if video_id else None
+
                     metadata = {
                         "title": info.get("title", "Unknown"),
                         "artist": info.get("uploader", "Unknown"),
-                        "thumbnail": info.get("thumbnail"),
+                        "thumbnail": thumbnail_url,
                         "year": year,
                     }
 
@@ -205,15 +210,18 @@ class YouTubeAudioScraper:
                 id3.add(TPE1(encoding=3, text=metadata["artist"]))
 
             # Add cover art if thumbnail available
+            cover_added = False
             if metadata.get("thumbnail"):
                 try:
                     self._add_cover_art(id3, metadata["thumbnail"])
+                    cover_added = True
                 except Exception as e:
                     logger.warning(f"Could not add cover art: {e}")
 
             id3.save(mp3_path, v2_version=3)
             year_info = f", Year='{metadata.get('year')}'" if metadata.get('year') else ""
-            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'{year_info}")
+            cover_info = ", Cover: Yes" if cover_added else ""
+            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'{year_info}{cover_info}")
 
         except Exception as e:
             logger.error(f"Failed to add metadata: {e}")
@@ -221,30 +229,51 @@ class YouTubeAudioScraper:
 
     def _add_cover_art(self, id3, thumbnail_url: str):
         """Download and add cover art from thumbnail URL."""
-        response = requests.get(thumbnail_url, timeout=THUMBNAIL_TIMEOUT, stream=True)
-        response.raise_for_status()
+        # Try maxresdefault first, fall back to other qualities if needed
+        thumbnail_urls = [
+            thumbnail_url,  # maxresdefault (original)
+            thumbnail_url.replace("maxresdefault", "sddefault"),  # 640x480
+            thumbnail_url.replace("maxresdefault", "hqdefault"),  # 480x360
+            thumbnail_url.replace("maxresdefault", "default"),    # 120x90
+        ]
 
-        # Get content length for progress bar
-        total_size = int(response.headers.get("content-length", 0))
+        content = None
+        for url in thumbnail_urls:
+            try:
+                response = requests.get(url, timeout=THUMBNAIL_TIMEOUT, stream=True)
+                response.raise_for_status()
 
-        # Download with progress bar if size is known
-        if total_size > 0:
-            with self._progress_bar(total_size, desc="Downloading cover art") as pbar:
-                content = b""
-                for chunk in response.iter_content(chunk_size=THUMBNAIL_CHUNK_SIZE):
-                    if chunk:
-                        content += chunk
-                        pbar.update(len(chunk))
-        else:
-            content = response.content
+                # Get content length for progress bar
+                total_size = int(response.headers.get("content-length", 0))
 
-        # Add cover art as APIC frame
+                # Download with progress bar if size is known
+                if total_size > 0:
+                    with self._progress_bar(total_size, desc="Downloading cover art") as pbar:
+                        content = b""
+                        for chunk in response.iter_content(chunk_size=THUMBNAIL_CHUNK_SIZE):
+                            if chunk:
+                                content += chunk
+                                pbar.update(len(chunk))
+                else:
+                    content = response.content
+
+                if content:
+                    logger.debug(f"Successfully downloaded thumbnail from {url}")
+                    break
+            except Exception as e:
+                logger.debug(f"Failed to download from {url}: {e}")
+                continue
+
+        if not content:
+            raise RuntimeError("Failed to download thumbnail from all available URLs")
+
+        # Add cover art as APIC frame with empty description for better compatibility
         id3.add(
             APIC(
                 encoding=3,
                 mime="image/jpeg",
                 type=3,  # Cover (front)
-                desc="Cover",
+                desc="",  # Empty description for better player compatibility
                 data=content,
             )
         )
