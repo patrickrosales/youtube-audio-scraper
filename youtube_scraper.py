@@ -2,6 +2,7 @@
 """YouTube Audio Scraper - Extract audio from YouTube videos and save as MP3 with metadata."""
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -28,15 +29,144 @@ THUMBNAIL_CHUNK_SIZE = 8192
 THUMBNAIL_TIMEOUT = 10
 
 
+class MetadataEditor:
+    """Handle interactive metadata editing and custom tagging rules."""
+
+    @staticmethod
+    def interactive_edit(metadata: dict) -> dict:
+        """
+        Prompt user to interactively edit metadata fields.
+        Returns modified metadata dictionary.
+        """
+        print("\n" + "=" * 60)
+        print("METADATA EDITOR - Press Enter to skip a field")
+        print("=" * 60)
+
+        editable_fields = [
+            ("title", "Title"),
+            ("artist", "Artist/Uploader"),
+            ("album", "Album (leave blank to use Artist)"),
+            ("year", "Year"),
+            ("description", "Description"),
+        ]
+
+        for field_key, field_label in editable_fields:
+            current_value = metadata.get(field_key, "")
+            if not current_value:
+                current_value = "(not set)"
+                display_value = ""
+            else:
+                display_value = current_value
+
+            # Truncate long values for display
+            if len(str(current_value)) > 60:
+                display_current = str(current_value)[:57] + "..."
+            else:
+                display_current = str(current_value)
+
+            prompt = f"{field_label}\n  Current: {display_current}\n  New value: "
+            user_input = input(prompt).strip()
+
+            if user_input:
+                metadata[field_key] = user_input
+            elif field_key == "album" and user_input == "":
+                # Album defaults to artist if left blank
+                if metadata.get("artist"):
+                    metadata[field_key] = metadata["artist"]
+
+        print("=" * 60 + "\n")
+        return metadata
+
+    @staticmethod
+    def apply_tagging_rules(metadata: dict, rules: dict) -> dict:
+        """
+        Apply custom tagging rules to metadata.
+        Rules format:
+        {
+            "album_source": "artist|title|custom:Album Name",
+            "artist_prefix": "Prefix - ",
+            "title_suffix": " (Audio)",
+            "description_template": "{artist} - {title}"
+        }
+        """
+        modified = metadata.copy()
+
+        # Handle album_source rule
+        if "album_source" in rules:
+            rule = rules["album_source"]
+            if rule == "artist":
+                modified["album"] = modified.get("artist", "Unknown")
+            elif rule == "title":
+                modified["album"] = modified.get("title", "Unknown")
+            elif rule.startswith("custom:"):
+                modified["album"] = rule[7:]  # Remove "custom:" prefix
+
+        # Handle artist_prefix
+        if "artist_prefix" in rules and modified.get("artist"):
+            modified["artist"] = rules["artist_prefix"] + modified["artist"]
+
+        # Handle title_suffix
+        if "title_suffix" in rules and modified.get("title"):
+            modified["title"] = modified["title"] + rules["title_suffix"]
+
+        # Handle description_template
+        if "description_template" in rules:
+            try:
+                template = rules["description_template"]
+                modified["description"] = template.format(**modified)
+            except KeyError as e:
+                logging.warning(f"Description template uses unknown field: {e}")
+
+        # Handle year extraction from release_date if year missing
+        if "auto_extract_year" in rules and rules["auto_extract_year"]:
+            if not modified.get("year") and modified.get("description"):
+                # Try to extract a 4-digit year from description
+                year_match = re.search(r"\b(19|20)\d{2}\b", modified["description"])
+                if year_match:
+                    modified["year"] = year_match.group(0)
+
+        return modified
+
+    @staticmethod
+    def load_rules_from_file(rules_file: str) -> dict:
+        """Load custom tagging rules from JSON file."""
+        try:
+            with open(rules_file, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logging.error(f"Rules file not found: {rules_file}")
+            return {}
+        except json.JSONDecodeError:
+            logging.error(f"Invalid JSON in rules file: {rules_file}")
+            return {}
+
+    @staticmethod
+    def save_rules_to_file(rules: dict, rules_file: str):
+        """Save custom tagging rules to JSON file."""
+        try:
+            with open(rules_file, "w") as f:
+                json.dump(rules, f, indent=2)
+            logging.info(f"Rules saved to: {rules_file}")
+        except Exception as e:
+            logging.error(f"Failed to save rules file: {e}")
+
+
 class YouTubeAudioScraper:
     """Handle YouTube audio extraction and MP3 metadata tagging."""
 
-    def __init__(self, output_dir=None):
-        """Initialize scraper with optional output directory."""
+    def __init__(self, output_dir=None, interactive_edit=False, rules_file=None):
+        """Initialize scraper with optional output directory and metadata customization."""
         self.output_dir = Path(output_dir or ".")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = None
         self.postproc_started = False
+        self.interactive_edit = interactive_edit
+        self.rules_file = rules_file
+        self.tagging_rules = {}
+
+        # Load rules if provided
+        if rules_file:
+            self.tagging_rules = MetadataEditor.load_rules_from_file(rules_file)
 
     def validate_youtube_url(self, url: str) -> bool:
         """Validate that the URL is a YouTube URL."""
@@ -255,9 +385,10 @@ class YouTubeAudioScraper:
             if metadata.get("artist"):
                 id3.add(TPE1(encoding=3, text=metadata["artist"]))
 
-            # Add album as uploader name (iTunes compatible)
-            if metadata.get("artist"):
-                id3.add(TALB(encoding=3, text=metadata["artist"]))
+            # Add album as uploader name by default, or custom album if provided (iTunes compatible)
+            album = metadata.get("album") or metadata.get("artist", "Unknown")
+            if album:
+                id3.add(TALB(encoding=3, text=album))
 
             # Add year using standard TYER frame (iTunes compatible)
             if metadata.get("year"):
@@ -356,6 +487,16 @@ class YouTubeAudioScraper:
         """Main scrape method: download audio and add metadata."""
         try:
             output_path, metadata = self.download_audio(url)
+
+            # Apply custom tagging rules if available
+            if self.tagging_rules:
+                logger.info("Applying custom tagging rules...")
+                metadata = MetadataEditor.apply_tagging_rules(metadata, self.tagging_rules)
+
+            # Interactive metadata editing if enabled
+            if self.interactive_edit:
+                metadata = MetadataEditor.interactive_edit(metadata)
+
             self.add_metadata(output_path, metadata)
             logger.info(f"✓ Saved to: {output_path}")
             return output_path
@@ -372,7 +513,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract audio from YouTube videos and save as MP3 with metadata."
     )
-    parser.add_argument("url", help="YouTube URL to scrape")
+    parser.add_argument("url", nargs="?", help="YouTube URL to scrape")
     parser.add_argument(
         "-o",
         "--output",
@@ -386,6 +527,23 @@ def main():
         action="store_true",
         help="Enable verbose logging output",
     )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Enable interactive metadata editing before saving",
+    )
+    parser.add_argument(
+        "-r",
+        "--rules",
+        dest="rules_file",
+        help="Path to JSON file with custom tagging rules",
+    )
+    parser.add_argument(
+        "--save-rules",
+        dest="save_rules_file",
+        help="Save a template rules file to the specified path",
+    )
 
     args = parser.parse_args()
 
@@ -395,7 +553,29 @@ def main():
     else:
         logger.setLevel(logging.INFO)
 
-    scraper = YouTubeAudioScraper(output_dir=args.output_dir)
+    # Handle --save-rules template generation
+    if args.save_rules_file:
+        template_rules = {
+            "album_source": "artist",
+            "artist_prefix": "",
+            "title_suffix": "",
+            "description_template": "{artist} - {title}",
+            "auto_extract_year": False,
+        }
+        MetadataEditor.save_rules_to_file(template_rules, args.save_rules_file)
+        logger.info(f"Template rules file created: {args.save_rules_file}")
+        logger.info("Edit this file to customize metadata tagging rules")
+        return
+
+    # URL is required if not using --save-rules
+    if not args.url:
+        parser.error("URL argument is required (unless using --save-rules)")
+
+    scraper = YouTubeAudioScraper(
+        output_dir=args.output_dir,
+        interactive_edit=args.interactive,
+        rules_file=args.rules_file,
+    )
     scraper.scrape(args.url)
 
 
