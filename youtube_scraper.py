@@ -14,7 +14,6 @@ from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TYER, TXXX, COMM, WOAR
-from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -37,7 +36,7 @@ class YouTubeAudioScraper:
         self.output_dir = Path(output_dir or ".")
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = None
-        self.pbar = None
+        self.postproc_started = False
 
     def validate_youtube_url(self, url: str) -> bool:
         """Validate that the URL is a YouTube URL."""
@@ -79,6 +78,9 @@ class YouTubeAudioScraper:
         # Use temp directory for temporary files
         with tempfile.TemporaryDirectory() as temp_dir:
             output_template = os.path.join(temp_dir, "%(title)s.%(ext)s")
+
+            # Reset postproc flag for this download
+            self.postproc_started = False
 
             ydl_opts = {
                 "format": "bestaudio/best",
@@ -156,48 +158,53 @@ class YouTubeAudioScraper:
                 logger.error(f"Failed to download video: {e}")
                 raise RuntimeError(f"Failed to download video: {e}")
 
-    @contextmanager
-    def _progress_bar(self, total: int, desc: str = "Progress"):
-        """Context manager for progress bar lifecycle."""
-        pbar = tqdm(
-            total=total,
-            unit="B",
-            unit_scale=True,
-            desc=desc,
-            leave=True,
-        )
-        try:
-            yield pbar
-        finally:
-            pbar.close()
-
     def _progress_hook(self, d: dict):
-        """Progress hook for yt-dlp downloads."""
+        """Progress hook for yt-dlp downloads and postprocessing."""
         if d["status"] == "downloading":
             total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
             downloaded_bytes = d.get("downloaded_bytes", 0)
 
             if total_bytes > 0:
-                # Initialize progress bar on first update
-                if self.pbar is None:
-                    self.pbar = tqdm(
-                        total=total_bytes,
-                        unit="B",
-                        unit_scale=True,
-                        desc="Downloading",
-                        leave=True,
-                    )
-
-                # Update progress bar
-                delta = downloaded_bytes - self.pbar.n
-                if delta > 0:
-                    self.pbar.update(delta)
+                percentage = (downloaded_bytes / total_bytes) * 100
+                # Display progress with visual bar
+                bar_length = 40
+                filled = int(bar_length * downloaded_bytes / total_bytes)
+                bar = "█" * filled + "░" * (bar_length - filled)
+                print(
+                    f"\rDownloading: |{bar}| {percentage:.1f}%",
+                    end="",
+                    flush=True,
+                )
 
         elif d["status"] == "finished":
-            if self.pbar is not None:
-                self.pbar.close()
-                self.pbar = None
-            logger.info("Download complete, converting to MP3...")
+            print()  # Newline after progress bar
+
+        elif d["status"] == "processing":
+            # Show postprocessor progress
+            if not self.postproc_started:
+                print()  # Newline before processing message
+                self.postproc_started = True
+
+            postprocessor = d.get("postprocessor", "FFmpeg")
+            print(f"\rProcessing: Converting to MP3 ({postprocessor})...", end="", flush=True)
+
+        elif d["status"] == "postprocess-progress":
+            # Some postprocessors provide detailed progress
+            if not self.postproc_started:
+                print()
+                self.postproc_started = True
+
+            maxHookLines = d.get("maxHookLines", 0)
+            if maxHookLines > 0:
+                percent = d.get("index", 0) / maxHookLines * 100
+                bar_length = 40
+                filled = int(bar_length * percent / 100)
+                bar = "█" * filled + "░" * (bar_length - filled)
+                print(
+                    f"\rProcessing: |{bar}| {percent:.1f}%",
+                    end="",
+                    flush=True,
+                )
 
     @staticmethod
     def _format_duration(duration_seconds: int) -> str:
@@ -322,20 +329,7 @@ class YouTubeAudioScraper:
             try:
                 response = requests.get(url, timeout=THUMBNAIL_TIMEOUT, stream=True)
                 response.raise_for_status()
-
-                # Get content length for progress bar
-                total_size = int(response.headers.get("content-length", 0))
-
-                # Download with progress bar if size is known
-                if total_size > 0:
-                    with self._progress_bar(total_size, desc="Downloading cover art") as pbar:
-                        content = b""
-                        for chunk in response.iter_content(chunk_size=THUMBNAIL_CHUNK_SIZE):
-                            if chunk:
-                                content += chunk
-                                pbar.update(len(chunk))
-                else:
-                    content = response.content
+                content = response.content
 
                 if content:
                     logger.debug(f"Successfully downloaded thumbnail from {url}")
