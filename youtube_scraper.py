@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
-from mutagen.id3 import ID3, APIC, TIT2, TPE1
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TYER, TXXX, COMM, WOAR
 from tqdm import tqdm
 
 # Configure logging
@@ -115,11 +115,24 @@ class YouTubeAudioScraper:
                     # YouTube thumbnail URL format: https://img.youtube.com/vi/VIDEO_ID/maxresdefault.jpg
                     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg" if video_id else None
 
+                    # Extract additional metadata
+                    duration = info.get("duration")  # Duration in seconds
+                    view_count = info.get("view_count")
+                    description = info.get("description", "")
+
+                    # Build video URL
+                    video_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+
                     metadata = {
                         "title": info.get("title", "Unknown"),
                         "artist": info.get("uploader", "Unknown"),
                         "thumbnail": thumbnail_url,
                         "year": year,
+                        "duration": duration,
+                        "view_count": view_count,
+                        "description": description,
+                        "video_url": video_url,
+                        "video_id": video_id,
                     }
 
                 # Find the converted MP3 file
@@ -188,6 +201,18 @@ class YouTubeAudioScraper:
                 self.pbar = None
             logger.info("Download complete, converting to MP3...")
 
+    @staticmethod
+    def _format_duration(duration_seconds: int) -> str:
+        """Format duration in seconds to HH:MM:SS format."""
+        if not duration_seconds:
+            return "0:00"
+        hours = duration_seconds // 3600
+        minutes = (duration_seconds % 3600) // 60
+        seconds = duration_seconds % 60
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
+
     def add_metadata(self, mp3_path: str, metadata: dict):
         """Add ID3 tags and cover art to MP3 file."""
         try:
@@ -201,13 +226,38 @@ class YouTubeAudioScraper:
             # Create new ID3 tags
             id3 = ID3()
 
-            # Add title
+            # Add title (iTunes compatible)
             if metadata.get("title"):
                 id3.add(TIT2(encoding=3, text=metadata["title"]))
 
-            # Add artist
+            # Add artist (iTunes compatible)
             if metadata.get("artist"):
                 id3.add(TPE1(encoding=3, text=metadata["artist"]))
+
+            # Add album as uploader name (iTunes compatible)
+            if metadata.get("artist"):
+                id3.add(TALB(encoding=3, text=metadata["artist"]))
+
+            # Add year using standard TYER frame (iTunes compatible)
+            if metadata.get("year"):
+                id3.add(TYER(encoding=3, text=metadata["year"]))
+
+            # Add description/comments (iTunes compatible)
+            if metadata.get("description"):
+                id3.add(COMM(encoding=3, lang="eng", desc="", text=metadata["description"]))
+
+            # Add video URL/webpage (iTunes may or may not display)
+            if metadata.get("video_url"):
+                id3.add(WOAR(url=metadata["video_url"]))
+
+            # Add view count as custom tag (iTunes won't display, but stored in file)
+            if metadata.get("view_count"):
+                id3.add(TXXX(encoding=3, desc="View Count", text=str(metadata["view_count"])))
+
+            # Add duration as custom tag (iTunes won't display, but stored in file)
+            if metadata.get("duration"):
+                duration_str = self._format_duration(metadata["duration"])
+                id3.add(TXXX(encoding=3, desc="Duration", text=duration_str))
 
             # Add cover art if thumbnail available
             cover_added = False
@@ -219,9 +269,25 @@ class YouTubeAudioScraper:
                     logger.warning(f"Could not add cover art: {e}")
 
             id3.save(mp3_path, v2_version=3)
-            year_info = f", Year='{metadata.get('year')}'" if metadata.get('year') else ""
-            cover_info = ", Cover: Yes" if cover_added else ""
-            logger.info(f"Metadata added: Title='{metadata.get('title')}', Artist='{metadata.get('artist')}'{year_info}{cover_info}")
+
+            # Build detailed metadata info for logging
+            metadata_parts = [f"Title='{metadata.get('title')}'", f"Artist='{metadata.get('artist')}'"]
+
+            if metadata.get('year'):
+                metadata_parts.append(f"Year='{metadata.get('year')}'")
+            if metadata.get('view_count'):
+                metadata_parts.append(f"Views={metadata.get('view_count'):,}")
+            if metadata.get('duration'):
+                duration_str = self._format_duration(metadata.get('duration'))
+                metadata_parts.append(f"Duration='{duration_str}'")
+            if metadata.get('video_url'):
+                metadata_parts.append("URL: Added")
+            if metadata.get('description'):
+                metadata_parts.append("Description: Added")
+            if cover_added:
+                metadata_parts.append("Cover: Yes")
+
+            logger.info(f"Metadata added: {', '.join(metadata_parts)}")
 
         except Exception as e:
             logger.error(f"Failed to add metadata: {e}")
